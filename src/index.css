@@ -1,0 +1,19 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html {
+  background: #0d0f14;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  background: #0d0f14;
+}
+
+button,
+textarea,
+input {
+  font: inherit;
+}
