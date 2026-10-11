@@ -1,10 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 
-const KEM_ALG = "ML-KEM-768";
-const SIG_ALG = "ML-DSA-65";
-const KEX_ALG = "X25519";
-const AES_ALG = "AES-256-GCM";
-const HKDF_INFO = new TextEncoder().encode("pq-secure-messaging:v1:aes-256-gcm");
+import { KEM_ALG,SIG_ALG,KEX_ALG,AES_ALG,HKDF_INFO,newId,toHex,shortHex,formatBytes,publicBytesFromBundle,importPublicBundle,packetBytes,packetToWireBytes,encryptMessage,decryptMessage,buildDemoApp,createPqProvider,generateHybridMaterial,fingerprintForBundle } from './crypto.js';
+import { registrationBytes } from './auth/registration.js';
 
 const initialState = {
   phase: "booting",
@@ -92,539 +89,53 @@ function reducer(state, action) {
   }
 }
 
-const encoder = new TextEncoder();
-const decoder = new TextDecoder();
-
-function ensureWebCrypto() {
-  if (!globalThis.crypto?.subtle) {
-    throw new Error("Web Crypto API is unavailable in this browser.");
-  }
-  return globalThis.crypto;
-}
-
-function newId(prefix) {
-  return `${prefix}-${globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
-}
-
-function randomBytes(length) {
-  const out = new Uint8Array(length);
-  ensureWebCrypto().getRandomValues(out);
-  return out;
-}
-
-function concatBytes(...chunks) {
-  const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    out.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return out;
-}
-
-function toHex(bytes) {
-  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
-function shortHex(bytes, chars = 80) {
-  const value = toHex(bytes);
-  return value.length > chars ? `${value.slice(0, chars)}...` : value;
-}
-
-function bytesToBase64(bytes) {
-  let binary = "";
-  for (let i = 0; i < bytes.length; i += 0x8000) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-  }
-  return btoa(binary);
-}
-
-function base64ToBytes(value) {
-  const normalized = value.trim().replace(/-/g, "+").replace(/_/g, "/");
-  const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
-  const binary = atob(padded);
-  const out = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) out[i] = binary.charCodeAt(i);
-  return out;
-}
-
-function formatBytes(length) {
-  return `${Math.round(length)} B`;
-}
-
-async function sha256(bytes) {
-  return new Uint8Array(await ensureWebCrypto().subtle.digest("SHA-256", bytes));
-}
-
-function constantTimeEqual(a, b) {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i += 1) diff |= a[i] ^ b[i];
-  return diff === 0;
-}
-
-async function hmacSha256(keyBytes, message) {
-  const key = await ensureWebCrypto().subtle.importKey(
-    "raw",
-    keyBytes,
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"]
-  );
-  return new Uint8Array(await ensureWebCrypto().subtle.sign("HMAC", key, message));
-}
-
-function coerceBytes(value) {
-  if (value instanceof Uint8Array) return value;
-  if (value instanceof ArrayBuffer) return new Uint8Array(value);
-  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-  if (Array.isArray(value)) return new Uint8Array(value);
-  if (typeof value === "string") return base64ToBytes(value);
-  throw new Error("Unable to normalize byte output from liboqs-wasm.");
-}
-
-function normalizeKeyPair(result) {
-  if (Array.isArray(result)) return { publicKey: coerceBytes(result[0]), privateKey: coerceBytes(result[1]) };
-  const publicValue = result.publicKey || result.public_key || result.pk;
-  const privateValue = result.privateKey || result.secretKey || result.secret_key || result.sk;
-  if (!publicValue || !privateValue) throw new Error("liboqs-wasm returned an unsupported keypair shape.");
-  return { publicKey: coerceBytes(publicValue), privateKey: coerceBytes(privateValue) };
-}
-
-function normalizeEncapsulation(result) {
-  if (Array.isArray(result)) return { ciphertext: coerceBytes(result[0]), sharedSecret: coerceBytes(result[1]) };
-  const ciphertext = result.ciphertext || result.cipherText || result.ct;
-  const sharedSecret = result.sharedSecret || result.shared_secret || result.ss;
-  if (!ciphertext || !sharedSecret) throw new Error("liboqs-wasm returned an unsupported encapsulation shape.");
-  return { ciphertext: coerceBytes(ciphertext), sharedSecret: coerceBytes(sharedSecret) };
-}
-
-async function callAny(instance, names, argOrders) {
-  for (const name of names) {
-    if (typeof instance?.[name] !== "function") continue;
-    for (const args of argOrders) {
-      try {
-        return await instance[name](...args);
-      } catch {
-        // Try the next liboqs-wasm binding shape.
-      }
-    }
-  }
-  throw new Error("No compatible liboqs-wasm method was found.");
-}
-
-function instantiateAlgorithm(Constructor, names) {
-  for (const name of names) {
-    try {
-      return new Constructor(name);
-    } catch {
-      // Try alternate NIST/legacy names.
-    }
-  }
-  return null;
-}
-
-async function tryCreateLiboqsProvider() {
-  try {
-    let oqs = globalThis.liboqs || globalThis.oqs || globalThis.OQS || globalThis.Module?.liboqs;
-    if (!oqs) return null;
-    if (typeof oqs.default === "function") oqs = await oqs.default();
-    if (typeof oqs.ready === "function") await oqs.ready();
-    if (oqs.ready?.then) await oqs.ready;
-    if (typeof oqs.init === "function") await oqs.init();
-
-    const KemConstructor = oqs.KEM || oqs.Kem || oqs.OQS_KEM;
-    const SigConstructor = oqs.Signature || oqs.SIG || oqs.OQS_SIG || oqs.Sign;
-    if (!KemConstructor || !SigConstructor) return null;
-
-    const makeKem = () => instantiateAlgorithm(KemConstructor, [KEM_ALG, "Kyber768"]);
-    const makeSig = () => instantiateAlgorithm(SigConstructor, [SIG_ALG, "Dilithium3"]);
-
-    const provider = {
-      name: "liboqs-wasm",
-      simulated: false,
-      async generateKemKeyPair() {
-        const kem = makeKem();
-        const result = await callAny(kem, ["generateKeypair", "generate_keypair", "keypair"], [[]]);
-        return normalizeKeyPair(result);
-      },
-      async kemEncapsulate(publicKey) {
-        const kem = makeKem();
-        const result = await callAny(kem, ["encapsulate", "encap", "kem_encapsulate"], [[publicKey]]);
-        return normalizeEncapsulation(result);
-      },
-      async kemDecapsulate(ciphertext, privateKey) {
-        const kem = makeKem();
-        const result = await callAny(kem, ["decapsulate", "decap", "kem_decapsulate"], [
-          [ciphertext, privateKey],
-          [privateKey, ciphertext],
-        ]);
-        return coerceBytes(result.sharedSecret || result.shared_secret || result.ss || result);
-      },
-      async generateDsaKeyPair() {
-        const sig = makeSig();
-        const result = await callAny(sig, ["generateKeypair", "generate_keypair", "keypair"], [[]]);
-        return normalizeKeyPair(result);
-      },
-      async sign(message, privateKey) {
-        const sig = makeSig();
-        const result = await callAny(sig, ["sign", "signDetached", "signature_sign"], [
-          [message, privateKey],
-          [privateKey, message],
-        ]);
-        return coerceBytes(result.signature || result.sig || result);
-      },
-      async verify(message, signature, publicKey) {
-        const sig = makeSig();
-        const result = await callAny(sig, ["verify", "verifyDetached", "signature_verify"], [
-          [message, signature, publicKey],
-          [signature, message, publicKey],
-          [publicKey, message, signature],
-        ]);
-        return Boolean(result);
-      },
-    };
-
-    const kem = await provider.generateKemKeyPair();
-    const encapsulated = await provider.kemEncapsulate(kem.publicKey);
-    const decapsulated = await provider.kemDecapsulate(encapsulated.ciphertext, kem.privateKey);
-    const sig = await provider.generateDsaKeyPair();
-    const probe = encoder.encode("liboqs-wasm probe");
-    const signature = await provider.sign(probe, sig.privateKey);
-    const verified = await provider.verify(probe, signature, sig.publicKey);
-
-    return constantTimeEqual(encapsulated.sharedSecret, decapsulated) && verified ? provider : null;
-  } catch {
-    return null;
-  }
-}
-
-function createMockPqProvider() {
-  return {
-    name: "deterministic mock",
-    simulated: true,
-    async generateKemKeyPair() {
-      return {
-        publicKey: randomBytes(1184),
-        privateKey: { publicKey: randomBytes(0), secretKey: randomBytes(2400) },
-      };
-    },
-    async kemEncapsulate(recipientPublicKey) {
-      const nonce = randomBytes(32);
-      const ciphertext = concatBytes(nonce, randomBytes(1088 - nonce.length));
-      return {
-        ciphertext,
-        sharedSecret: await sha256(concatBytes(recipientPublicKey, nonce)),
-      };
-    },
-    async kemDecapsulate(ciphertext, privateKey) {
-      const nonce = ciphertext.slice(0, 32);
-      return sha256(concatBytes(privateKey.publicKey, nonce));
-    },
-    async generateDsaKeyPair() {
-      const seed = randomBytes(32);
-      return {
-        publicKey: concatBytes(seed, randomBytes(1952 - seed.length)),
-        privateKey: concatBytes(seed, randomBytes(4032 - seed.length)),
-      };
-    },
-    async sign(message, privateKey) {
-      return hmacSha256(privateKey.slice(0, 32), message);
-    },
-    async verify(message, signature, publicKey) {
-      const expected = await hmacSha256(publicKey.slice(0, 32), message);
-      return constantTimeEqual(expected, signature);
-    },
-  };
-}
-
-async function createPqProvider() {
-  return (await tryCreateLiboqsProvider()) || createMockPqProvider();
-}
-
-async function generateX25519KeyPair() {
-  const pair = await ensureWebCrypto().subtle.generateKey({ name: KEX_ALG }, true, ["deriveBits"]);
-  return {
-    publicKey: pair.publicKey,
-    privateKey: pair.privateKey,
-    publicRaw: new Uint8Array(await ensureWebCrypto().subtle.exportKey("raw", pair.publicKey)),
-  };
-}
-
-async function deriveX25519(privateKey, peerPublicRaw) {
-  const peerPublicKey = await ensureWebCrypto().subtle.importKey("raw", peerPublicRaw, { name: KEX_ALG }, false, []);
-  return new Uint8Array(
-    await ensureWebCrypto().subtle.deriveBits({ name: KEX_ALG, public: peerPublicKey }, privateKey, 256)
-  );
-}
-
-async function deriveAesKey(pqSecret, classicalSecret, kemCiphertext, senderX25519Public, recipientX25519Public) {
-  const ikm = concatBytes(pqSecret, classicalSecret);
-  const salt = await sha256(concatBytes(kemCiphertext, senderX25519Public, recipientX25519Public));
-  const hkdfKey = await ensureWebCrypto().subtle.importKey("raw", ikm, "HKDF", false, ["deriveBits"]);
-
-  // RFC 5869: HKDF-SHA-256 extracts from PQ + classical shared secrets and expands to 32 bytes.
-  const aesRaw = new Uint8Array(
-    await ensureWebCrypto().subtle.deriveBits(
-      { name: "HKDF", hash: "SHA-256", salt, info: HKDF_INFO },
-      hkdfKey,
-      256
-    )
-  );
-
-  return ensureWebCrypto().subtle.importKey("raw", aesRaw, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
-}
-
-function canonicalPublicBundle(bundle) {
-  return {
-    version: 1,
-    alg: { kex: KEX_ALG, kem: KEM_ALG, sig: SIG_ALG },
-    x25519: bundle.x25519,
-    mlkem: bundle.mlkem,
-    mldsa: bundle.mldsa,
-  };
-}
-
-function publicBundleBytes(bundle) {
-  return encoder.encode(JSON.stringify(canonicalPublicBundle(bundle)));
-}
-
-function exportPublicBundle(bundle) {
-  return bytesToBase64(publicBundleBytes(bundle));
-}
-
-function publicBytesFromBundle(bundle) {
-  return {
-    x25519: base64ToBytes(bundle.x25519),
-    mlkem: base64ToBytes(bundle.mlkem),
-    mldsa: base64ToBytes(bundle.mldsa),
-  };
-}
-
-async function fingerprintForBundle(bundle) {
-  return toHex(await sha256(publicBundleBytes(bundle))).slice(0, 16);
-}
-
-async function importPublicBundle(value) {
-  const parsed = JSON.parse(decoder.decode(base64ToBytes(value)));
-  const bundle = canonicalPublicBundle(parsed);
-  const publicBytes = publicBytesFromBundle(bundle);
-  if (publicBytes.x25519.length !== 32) throw new Error("Imported public key is not an X25519 bundle.");
-  if (!publicBytes.mlkem.length || !publicBytes.mldsa.length) throw new Error("Imported public key is missing PQ keys.");
-  return {
-    publicBundle: bundle,
-    publicExport: exportPublicBundle(bundle),
-    fingerprint: await fingerprintForBundle(bundle),
-  };
-}
-
-async function generateHybridMaterial(pq) {
-  const x25519 = await generateX25519KeyPair();
-  const kem = await pq.generateKemKeyPair();
-  if (pq.simulated && kem.privateKey.publicKey.length === 0) kem.privateKey.publicKey = kem.publicKey;
-  const dsa = await pq.generateDsaKeyPair();
-
-  const publicBundle = canonicalPublicBundle({
-    x25519: bytesToBase64(x25519.publicRaw),
-    mlkem: bytesToBase64(kem.publicKey),
-    mldsa: bytesToBase64(dsa.publicKey),
-  });
-
-  return {
-    keys: { x25519, kem, dsa },
-    publicBundle,
-    publicExport: exportPublicBundle(publicBundle),
-    fingerprint: await fingerprintForBundle(publicBundle),
-  };
-}
-
-function packetBytes(packet) {
-  return {
-    kemCt: base64ToBytes(packet.kem_ct),
-    iv: base64ToBytes(packet.iv),
-    ciphertext: base64ToBytes(packet.ciphertext),
-    tag: base64ToBytes(packet.tag),
-    signature: base64ToBytes(packet.signature),
-  };
-}
-
-function packetToWireBytes(packet) {
-  const fields = packetBytes(packet);
-  return concatBytes(fields.kemCt, fields.iv, fields.ciphertext, fields.tag, fields.signature);
-}
-
-function signedPayload(kemCt, ciphertext, iv, tag) {
-  return concatBytes(kemCt, ciphertext, iv, tag);
-}
-
-async function encryptMessage({ plaintext, senderKeys, senderPublicBundle, recipientPublicBundle, pq }) {
-  const recipientPublic = publicBytesFromBundle(recipientPublicBundle);
-
-  // FIPS 203: ML-KEM-768 encapsulates a PQ shared secret to the recipient public key.
-  const kem = await pq.kemEncapsulate(recipientPublic.mlkem);
-
-  // RFC 7748: X25519 ECDH derives the classical shared secret through Web Crypto.
-  const classicalSecret = await deriveX25519(senderKeys.x25519.privateKey, recipientPublic.x25519);
-
-  const aesKey = await deriveAesKey(
-    kem.sharedSecret,
-    classicalSecret,
-    kem.ciphertext,
-    senderKeys.x25519.publicRaw,
-    recipientPublic.x25519
-  );
-
-  const iv = randomBytes(12);
-
-  // FIPS 197 AES + NIST SP 800-38D: AES-256-GCM encrypts plaintext with a 12-byte IV and 16-byte tag.
-  const sealed = new Uint8Array(
-    await ensureWebCrypto().subtle.encrypt(
-      { name: "AES-GCM", iv, tagLength: 128 },
-      aesKey,
-      encoder.encode(plaintext)
-    )
-  );
-  const ciphertext = sealed.slice(0, sealed.length - 16);
-  const tag = sealed.slice(sealed.length - 16);
-
-  // FIPS 204: ML-DSA-65 signs KEM_ct || AES_ct || IV || tag.
-  const signature = await pq.sign(signedPayload(kem.ciphertext, ciphertext, iv, tag), senderKeys.dsa.privateKey);
-
-  return {
-    packet: {
-      kem_ct: bytesToBase64(kem.ciphertext),
-      iv: bytesToBase64(iv),
-      ciphertext: bytesToBase64(ciphertext),
-      tag: bytesToBase64(tag),
-      signature: bytesToBase64(signature),
-    },
-    byteCounts: {
-      kemCt: kem.ciphertext.length,
-      iv: iv.length,
-      ciphertext: ciphertext.length,
-      tag: tag.length,
-      signature: signature.length,
-    },
-    simulatedPq: pq.simulated,
-  };
-}
-
-async function decryptMessage({ message, recipientKeys, pq }) {
-  const senderPublic = publicBytesFromBundle(message.senderPublicBundle);
-  const fields = packetBytes(message.packet);
-
-  // FIPS 203: ML-KEM-768 decapsulates the PQ shared secret with the recipient private key.
-  const pqSecret = await pq.kemDecapsulate(fields.kemCt, recipientKeys.kem.privateKey);
-
-  // RFC 7748: X25519 ECDH derives the classical shared secret through Web Crypto.
-  const classicalSecret = await deriveX25519(recipientKeys.x25519.privateKey, senderPublic.x25519);
-
-  const aesKey = await deriveAesKey(
-    pqSecret,
-    classicalSecret,
-    fields.kemCt,
-    senderPublic.x25519,
-    recipientKeys.x25519.publicRaw
-  );
-
-  // FIPS 204: ML-DSA-65 verifies KEM_ct || AES_ct || IV || tag before plaintext display.
-  const signatureValid = await pq.verify(
-    signedPayload(fields.kemCt, fields.ciphertext, fields.iv, fields.tag),
-    fields.signature,
-    senderPublic.mldsa
-  );
-
-  // FIPS 197 AES + NIST SP 800-38D: AES-256-GCM opens ciphertext || tag with the derived key.
-  const opened = await ensureWebCrypto().subtle.decrypt(
-    { name: "AES-GCM", iv: fields.iv, tagLength: 128 },
-    aesKey,
-    concatBytes(fields.ciphertext, fields.tag)
-  );
-
-  return { plaintext: decoder.decode(opened), signatureValid };
-}
-
-async function buildDemoApp(pq) {
-  const identity = await generateHybridMaterial(pq);
-  const aliceMaterial = await generateHybridMaterial(pq);
-  const aliceId = newId("alice");
-
-  const alice = {
-    id: aliceId,
-    name: "Alice",
-    publicBundle: aliceMaterial.publicBundle,
-    publicExport: aliceMaterial.publicExport,
-    fingerprint: aliceMaterial.fingerprint,
-    privateKeys: aliceMaterial.keys,
-    demoPrivate: true,
-  };
-
-  const encrypted = await encryptMessage({
-    plaintext: "Post-quantum hello from Alice. This packet was sealed to your hybrid public key.",
-    senderKeys: aliceMaterial.keys,
-    senderPublicBundle: aliceMaterial.publicBundle,
-    recipientPublicBundle: identity.publicBundle,
-    pq,
-  });
-
-  const demoMessage = {
-    id: newId("msg"),
-    contactId: aliceId,
-    direction: "incoming",
-    senderId: aliceId,
-    recipientId: "me",
-    senderName: "Alice",
-    recipientName: "You",
-    senderPublicBundle: aliceMaterial.publicBundle,
-    recipientPublicBundle: identity.publicBundle,
-    packet: encrypted.packet,
-    byteCounts: encrypted.byteCounts,
-    simulatedPq: encrypted.simulatedPq,
-    createdAt: Date.now(),
-    decrypted: null,
-  };
-
-  return {
-    identity,
-    contacts: [alice],
-    selectedContactId: aliceId,
-    messages: { [aliceId]: [demoMessage] },
-  };
-}
-
 function errorText(error) {
   return error?.message || String(error);
 }
 
-function Pill({ children, tone = "purple" }) {
+// Algorithm names, byte counts and other technical labels render in mono.
+function Pill({ children, tone = "neutral", mono = false }) {
   const tones = {
-    purple: "border-[#7c3aed]/40 bg-[#7c3aed]/15 text-violet-200",
-    yellow: "border-amber-400/40 bg-amber-400/15 text-amber-200",
-    green: "border-emerald-400/40 bg-emerald-400/15 text-emerald-200",
-    red: "border-rose-400/40 bg-rose-400/15 text-rose-200",
-    zinc: "border-white/10 bg-white/5 text-zinc-300",
+    neutral: "bg-canvas-soft-2 text-body shadow-hairline",
+    success: "bg-link-bg-soft text-link-deep",
+    warning: "bg-warning-soft text-warning-deep",
+    error: "bg-error-soft text-error-deep",
   };
   return (
-    <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${tones[tone]}`}>
+    <span
+      className={`inline-flex h-5 items-center whitespace-nowrap rounded-full px-2 ${
+        mono ? "font-mono text-[11px]" : "text-xs font-medium"
+      } ${tones[tone]}`}
+    >
       {children}
     </span>
   );
 }
 
 function SimulatedBadge() {
-  return <Pill tone="yellow">⚠ Simulated PQ</Pill>;
+  return <Pill tone="warning">Simulated PQ</Pill>;
 }
 
 function SignatureBadge({ valid }) {
-  return valid ? <Pill tone="green">✓ Signature valid</Pill> : <Pill tone="red">✗ Invalid</Pill>;
+  return valid ? <Pill tone="success">✓ Signature valid</Pill> : <Pill tone="error">✗ Invalid signature</Pill>;
 }
+
+const buttonPrimary =
+  "inline-flex items-center justify-center gap-2 rounded-md bg-ink px-3 font-medium text-on-primary transition-colors hover:bg-[#383838] disabled:cursor-not-allowed disabled:bg-canvas-soft-2 disabled:text-hairline-strong disabled:shadow-hairline";
+const buttonSecondary =
+  "inline-flex items-center justify-center gap-2 rounded-md bg-canvas px-3 font-medium text-ink shadow-hairline transition-colors hover:bg-canvas-soft-2 disabled:cursor-not-allowed disabled:text-hairline-strong";
+const iconButton =
+  "inline-flex shrink-0 items-center justify-center rounded-md bg-canvas text-body shadow-hairline transition-colors hover:bg-canvas-soft-2 hover:text-ink";
+const formField =
+  "w-full rounded-md border border-hairline bg-canvas px-3 text-sm text-ink outline-none transition-shadow placeholder:text-mute focus:border-hairline-strong focus:ring-2 focus:ring-ink/10 disabled:bg-canvas-soft-2";
+const card = "rounded-lg bg-canvas shadow-subtle";
+const eyebrow = "font-mono text-xs uppercase text-mute";
 
 function LockIcon({ active = false, className = "" }) {
   return (
     <svg
       viewBox="0 0 24 24"
-      className={`${active ? "animate-pulse text-[#7c3aed]" : "text-zinc-300"} ${className}`}
+      className={`${active ? "animate-pulse" : ""} ${className}`}
       fill="none"
       stroke="currentColor"
       strokeWidth="1.8"
@@ -697,25 +208,24 @@ function SendIcon({ className = "" }) {
 
 function ToastStack({ toasts, onDismiss }) {
   return (
-    <div className="fixed right-4 top-4 z-50 flex w-[min(420px,calc(100vw-2rem))] flex-col gap-2">
+    <div className="fixed right-4 top-4 z-50 flex w-[min(420px,calc(100vw-2rem))] flex-col gap-2" role="status" aria-live="polite">
       {toasts.map((toast) => (
-        <div
-          key={toast.id}
-          className={`rounded-lg border px-3 py-2 text-sm shadow-2xl backdrop-blur ${
-            toast.kind === "success"
-              ? "border-emerald-400/30 bg-emerald-950/80 text-emerald-100"
-              : toast.kind === "warning"
-                ? "border-amber-400/30 bg-amber-950/80 text-amber-100"
-                : "border-rose-400/30 bg-rose-950/80 text-rose-100"
-          }`}
-        >
+        <div key={toast.id} className="rounded-lg bg-canvas px-4 py-3 text-sm text-ink shadow-modal">
           <div className="flex items-start justify-between gap-3">
-            <span>{toast.message}</span>
+            <span className="flex items-start gap-2.5">
+              <span
+                aria-hidden="true"
+                className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${
+                  toast.kind === "success" ? "bg-link" : toast.kind === "warning" ? "bg-warning" : "bg-error"
+                }`}
+              />
+              <span>{toast.message}</span>
+            </span>
             <button
               type="button"
               onClick={() => onDismiss(toast.id)}
-              className="rounded px-1 text-xs text-white/70 hover:bg-white/10 hover:text-white"
-              aria-label="Dismiss toast"
+              className="rounded px-1.5 text-body hover:bg-canvas-soft-2 hover:text-ink"
+              aria-label="Dismiss notification"
             >
               ×
             </button>
@@ -728,46 +238,47 @@ function ToastStack({ toasts, onDismiss }) {
 
 function AlgorithmSidebar() {
   return (
-    <aside className="rounded-lg border border-white/10 bg-white/[0.03] p-4">
+    <aside className={`${card} self-start p-5`}>
       <div className="mb-4 flex items-center justify-between gap-3">
-        <h2 className="text-sm font-semibold text-zinc-100">Algorithm Stack</h2>
-        <Pill tone="purple">hybrid</Pill>
+        <h2 className="text-sm font-semibold tracking-[-0.28px]">Algorithm stack</h2>
+        <Pill>Hybrid</Pill>
       </div>
 
-      <div className="space-y-2 text-xs">
+      <div className="divide-y divide-hairline rounded-md shadow-hairline">
         {[
           ["ML-KEM-768", "FIPS 203"],
           ["ML-DSA-65", "FIPS 204"],
           ["AES-256-GCM", "AES + GCM"],
           ["HKDF-SHA-256", "RFC 5869"],
         ].map(([name, ref]) => (
-          <div key={name} className="flex items-center justify-between rounded-md border border-white/10 bg-black/20 px-3 py-2">
-            <span className="text-zinc-100">{name}</span>
-            <span className="text-zinc-500">{ref}</span>
+          <div key={name} className="flex items-center justify-between px-3 py-2.5">
+            <span className="font-mono text-xs text-ink">{name}</span>
+            <span className="text-xs text-mute">{ref}</span>
           </div>
         ))}
       </div>
 
-      <div className="mt-5">
-        <div className="mb-2 flex items-center justify-between text-[10px] text-zinc-500">
-          <span>classical only</span>
-          <span>hybrid</span>
-          <span>full PQ</span>
+      <div className="mt-6">
+        <div className={`${eyebrow} mb-2`}>Protection level</div>
+        <div className="grid h-1.5 grid-cols-3 gap-1">
+          <div className="rounded-full bg-hairline" />
+          <div className="rounded-full bg-ink" />
+          <div className="rounded-full bg-hairline" />
         </div>
-        <div className="grid h-3 grid-cols-3 gap-1 overflow-hidden rounded-full border border-white/10 bg-black/30 p-0.5">
-          <div className="rounded-full bg-zinc-700" />
-          <div className="rounded-full bg-[#7c3aed] shadow-[0_0_18px_rgba(124,58,237,0.6)]" />
-          <div className="rounded-full bg-zinc-800" />
+        <div className="mt-2 grid grid-cols-3 text-xs text-mute">
+          <span>Classical</span>
+          <span className="text-center font-medium text-ink">Hybrid</span>
+          <span className="text-right">Full PQ</span>
         </div>
-        <div className="mt-3">
-          <Pill tone="zinc">X25519 + ML-KEM</Pill>
+        <div className="mt-4">
+          <Pill mono>X25519 + ML-KEM</Pill>
         </div>
       </div>
     </aside>
   );
 }
 
-function MessageCard({ message, identity, contacts, pq, onCopy, onDecrypt, onHide }) {
+function MessageCard({ message, identity, contacts, pq, isBusy, onCopy, onDecrypt, onHide }) {
   const wireBytes = useMemo(() => packetToWireBytes(message.packet), [message.packet]);
   const fields = useMemo(() => packetBytes(message.packet), [message.packet]);
   const isOutgoing = message.direction === "outgoing";
@@ -775,45 +286,41 @@ function MessageCard({ message, identity, contacts, pq, onCopy, onDecrypt, onHid
 
   return (
     <div className={`flex ${isOutgoing ? "justify-end" : "justify-start"}`}>
-      <div
-        className={`w-full max-w-[760px] rounded-lg border p-3 ${
-          isOutgoing ? "border-[#7c3aed]/30 bg-[#7c3aed]/10" : "border-white/10 bg-black/20"
-        }`}
-      >
-        <div className="flex flex-wrap items-center justify-between gap-2">
+      <div className={`w-full max-w-[680px] rounded-lg p-4 ${isOutgoing ? "bg-canvas-soft shadow-hairline" : "bg-canvas shadow-subtle"}`}>
+        <div className="flex flex-wrap items-start justify-between gap-2">
           <div className="min-w-0">
-            <div className="text-xs font-semibold text-zinc-100">
+            <div className="text-sm font-medium tracking-[-0.28px]">
               {isOutgoing ? "You → " : `${message.senderName} → `}
               {isOutgoing ? message.recipientName : "You"}
             </div>
-            <div className="text-[11px] text-zinc-500">{new Date(message.createdAt).toLocaleString()}</div>
+            <div className="text-xs text-mute">{new Date(message.createdAt).toLocaleString()}</div>
           </div>
           <div className="flex flex-wrap items-center gap-1.5">
-            <Pill tone="purple">{KEM_ALG}</Pill>
-            <Pill tone="purple">{AES_ALG}</Pill>
+            <Pill mono>{KEM_ALG}</Pill>
+            <Pill mono>{AES_ALG}</Pill>
             {message.simulatedPq && <SimulatedBadge />}
           </div>
         </div>
 
-        <div className="mt-3 rounded-md border border-white/10 bg-black/40 p-3">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="flex flex-wrap gap-1.5 text-[11px]">
-              <Pill tone="zinc">KEM ct {formatBytes(fields.kemCt.length)}</Pill>
-              <Pill tone="zinc">AES ct {formatBytes(fields.ciphertext.length)}</Pill>
-              <Pill tone="zinc">tag {formatBytes(fields.tag.length)}</Pill>
-              <Pill tone="zinc">sig {formatBytes(fields.signature.length)}</Pill>
+        <div className="mt-3 overflow-hidden rounded-md bg-ink">
+          <div className="flex items-center justify-between gap-2 border-b border-white/10 px-3 py-2">
+            <div className="flex flex-wrap gap-x-3 gap-y-1 font-mono text-[11px] text-hairline-strong">
+              <span>KEM ct {formatBytes(fields.kemCt.length)}</span>
+              <span>AES ct {formatBytes(fields.ciphertext.length)}</span>
+              <span>tag {formatBytes(fields.tag.length)}</span>
+              <span>sig {formatBytes(fields.signature.length)}</span>
             </div>
             <button
               type="button"
               onClick={() => onCopy(toHex(wireBytes), "Full encrypted packet copied.")}
-              className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-white/10 text-zinc-300 hover:border-[#7c3aed]/60 hover:text-violet-200"
+              className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-hairline-strong transition-colors hover:bg-white/10 hover:text-on-primary"
               title="Copy full encrypted packet"
               aria-label="Copy full encrypted packet"
             >
               <CopyIcon className="h-4 w-4" />
             </button>
           </div>
-          <pre className="mt-2 max-h-24 overflow-auto whitespace-pre-wrap break-all rounded bg-[#0d0f14] p-2 font-mono text-xs leading-5 text-violet-100">
+          <pre className="max-h-24 overflow-auto whitespace-pre-wrap break-all px-3 py-2.5 font-mono text-[13px] leading-5 text-[#ededed]">
             {shortHex(wireBytes, 80)}
           </pre>
         </div>
@@ -822,22 +329,22 @@ function MessageCard({ message, identity, contacts, pq, onCopy, onDecrypt, onHid
           <button
             type="button"
             onClick={() => (canReveal ? onHide(message) : onDecrypt(message))}
-            className="inline-flex items-center gap-2 rounded-md border border-[#7c3aed]/50 bg-[#7c3aed]/20 px-3 py-2 text-xs font-semibold text-violet-100 hover:bg-[#7c3aed]/30 disabled:cursor-not-allowed disabled:opacity-50"
-            disabled={!identity || !pq}
+            className={`${canReveal ? buttonSecondary : buttonPrimary} h-8 text-sm`}
+            disabled={!identity || !pq || isBusy}
           >
-            <LockIcon active={false} className="h-4 w-4" />
+            <LockIcon className="h-4 w-4" />
             {canReveal ? "Hide plaintext" : "Decrypt"}
           </button>
           {message.decrypted?.revealed && <SignatureBadge valid={message.decrypted.signatureValid} />}
         </div>
 
         {message.decrypted?.revealed && (
-          <div className="mt-3 rounded-md border border-emerald-400/20 bg-emerald-400/10 p-3 text-sm text-emerald-50">
-            <div className="mb-2 flex flex-wrap gap-1.5">
-              <Pill tone="green">plaintext</Pill>
-              <Pill tone="zinc">{HKDF_INFO.length} B HKDF info</Pill>
+          <div className="mt-3 rounded-md bg-canvas p-3 shadow-hairline">
+            <div className="mb-2 flex flex-wrap items-center gap-2">
+              <span className={eyebrow}>Plaintext</span>
+              <Pill mono>{HKDF_INFO.length} B HKDF info</Pill>
             </div>
-            <p className="whitespace-pre-wrap break-words font-sans leading-6">{message.decrypted.plaintext}</p>
+            <p className="whitespace-pre-wrap break-words leading-6 text-ink">{message.decrypted.plaintext}</p>
           </div>
         )}
       </div>
@@ -845,12 +352,21 @@ function MessageCard({ message, identity, contacts, pq, onCopy, onDecrypt, onHid
   );
 }
 
-export default function App() {
+export default function App({ auth = null }) {
   const [state, dispatch] = useReducer(reducer, initialState);
   const [contactName, setContactName] = useState("");
   const [contactKey, setContactKey] = useState("");
   const [composer, setComposer] = useState("");
   const initialized = useRef(false);
+  const relay = useRef(null);
+  const seenPackets = useRef(new Set());
+  const operation = useRef(false);
+  const [relayStatus, setRelayStatus] = useState('offline');
+  const [relayAttempt, setRelayAttempt] = useState(0);
+  const getToken = useRef(auth?.getToken);
+  getToken.current = auth?.getToken;
+  const accountId = auth?.userId;
+  const accountSessionId = auth?.sessionId;
 
   const pushToast = useCallback((message, kind = "error") => {
     dispatch({ type: "ADD_TOAST", toast: { id: newId("toast"), message, kind } });
@@ -870,7 +386,7 @@ export default function App() {
           selectedContactId: demo.selectedContactId,
           messages: demo.messages,
         });
-        if (pq.simulated) pushToast("liboqs-wasm unavailable; PQ primitives are running in simulated mode.", "warning");
+
       } catch (error) {
         dispatch({ type: "BOOT_ERROR", error: errorText(error) });
         pushToast(errorText(error), "error");
@@ -884,6 +400,54 @@ export default function App() {
     initialized.current = true;
     loadDemo();
   }, [loadDemo]);
+
+  const receiveState = useRef(state);
+  receiveState.current = state;
+  useEffect(() => {
+    if (!state.identity || !accountId || !accountSessionId) return;
+    const socket = new WebSocket(import.meta.env.VITE_RELAY_URL || 'ws://127.0.0.1:8787');
+    relay.current = socket;
+    setRelayStatus('connecting');
+    const sendToken = async () => {
+      const token = await getToken.current({ skipCache: true });
+      if (!token) throw new Error('Sign in again to connect.');
+      if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'auth', token }));
+    };
+    const refresh = setInterval(() => { if (socket.readyState === WebSocket.OPEN) sendToken().catch(() => socket.close()); }, 25000);
+    socket.onclose = () => { if (relay.current === socket) setRelayStatus('offline'); };
+    socket.onerror = () => { if (relay.current === socket) setRelayStatus('offline'); };
+    // Serialize received verification so duplicate packets cannot race.
+    let queue = Promise.resolve();
+    socket.onmessage = (event) => {
+      queue = queue.then(async () => {
+        const frame = JSON.parse(event.data);
+        if (frame.type === 'challenge') {
+          const token = await getToken.current({ skipCache: true });
+          if (!token) throw new Error('Sign in again to connect.');
+          const proof = await state.pq.sign(registrationBytes(frame.challenge, accountId, state.identity.fingerprint), state.identity.keys.dsa.privateKey);
+          const encoded = btoa(String.fromCharCode(...proof));
+          if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'register', token, publicExport: state.identity.publicExport, proof: encoded }));
+          return;
+        }
+        if (frame.type === 'registered') { setRelayStatus('connected'); return; }
+        if (frame.type === 'error') { pushToast(frame.message); return; }
+        if (frame.type === 'delivered') { pushToast('Packet delivered to recipient browser.', 'success'); return; }
+        if (frame.type !== 'message') return;
+        const current = receiveState.current;
+        const header = frame.packet?.header;
+        if (!header || seenPackets.current.has(header.id)) throw new Error('Duplicate or invalid packet rejected.');
+        const contact = current.contacts.find((entry) => !entry.demoPrivate && entry.fingerprint === header.sender);
+        if (!contact) throw new Error('Unknown sender. Import and verify their public key first.');
+        const message = { id: header.id, contactId: contact.id, direction: 'incoming', senderId: contact.id, recipientId: 'me', senderName: contact.name, recipientName: 'You', senderPublicBundle: contact.publicBundle, recipientPublicBundle: current.identity.publicBundle, packet: frame.packet, simulatedPq: false, createdAt: Date.now(), decrypted: null };
+        await decryptMessage({ message, recipientKeys: current.identity.keys, pq: current.pq });
+        if (relay.current !== socket) return;
+        seenPackets.current.add(header.id);
+        dispatch({ type: 'ADD_MESSAGE', message });
+        pushToast('Authenticated message received.', 'success');
+      }).catch((error) => pushToast(errorText(error)));
+    };
+    return () => { clearInterval(refresh); if (relay.current === socket) relay.current = null; socket.close(); };
+  }, [state.identity, pushToast, accountId, accountSessionId, relayAttempt]);
 
   const selectedContact = useMemo(
     () => state.contacts.find((contact) => contact.id === state.selectedContactId) || null,
@@ -915,8 +479,10 @@ export default function App() {
   );
 
   const handleRegenerate = useCallback(async () => {
+    if (operation.current) return;
     if (!window.confirm("Regenerate hybrid keys? Existing demo threads will be replaced.")) return;
-    await loadDemo(state.pq);
+    operation.current = true;
+    try { await loadDemo(state.pq); } finally { operation.current = false; }
     pushToast("Hybrid keys regenerated.", "success");
   }, [loadDemo, pushToast, state.pq]);
 
@@ -926,6 +492,7 @@ export default function App() {
       if (!contactKey.trim()) throw new Error("Base64 public key is required.");
 
       const imported = await importPublicBundle(contactKey.trim());
+      if (state.contacts.some((contact) => contact.fingerprint === imported.fingerprint)) throw new Error("Contact already exists.");
       const contact = {
         id: newId("contact"),
         name: contactName.trim(),
@@ -943,15 +510,17 @@ export default function App() {
     } catch (error) {
       pushToast(errorText(error), "error");
     }
-  }, [contactKey, contactName, pushToast]);
+  }, [contactKey, contactName, pushToast, state.contacts]);
 
   const handleSend = useCallback(async () => {
-    if (!state.identity || !state.pq || !selectedContact) return;
+    if (!state.identity || !state.pq || !selectedContact || operation.current) return;
+    if (!selectedContact.demoPrivate && relayStatus !== 'connected') { pushToast('Start the relay and connect the recipient browser.'); return; }
     if (!composer.trim()) {
       pushToast("Message text is required.", "error");
       return;
     }
 
+    operation.current = true;
     dispatch({ type: "SET_BUSY", isBusy: true, label: "encrypting" });
     try {
       const encrypted = await encryptMessage({
@@ -979,19 +548,25 @@ export default function App() {
         decrypted: null,
       };
 
+      if (!selectedContact.demoPrivate) {
+        if (relay.current?.readyState !== WebSocket.OPEN) throw new Error('Relay disconnected.');
+        relay.current.send(JSON.stringify({ type: 'message', packet: encrypted.packet }));
+      }
       dispatch({ type: "ADD_MESSAGE", message });
       setComposer("");
       pushToast("Encrypted packet stored in thread.", "success");
     } catch (error) {
       pushToast(errorText(error), "error");
     } finally {
-      dispatch({ type: "SET_BUSY", isBusy: false });
+      operation.current = false;
+        dispatch({ type: "SET_BUSY", isBusy: false });
     }
-  }, [composer, pushToast, selectedContact, state.identity, state.pq]);
+  }, [composer, pushToast, selectedContact, state.identity, state.pq, relayStatus]);
 
   const handleDecrypt = useCallback(
     async (message) => {
-      if (!state.identity || !state.pq) return;
+      if (!state.identity || !state.pq || operation.current) return;
+      operation.current = true;
 
       dispatch({ type: "SET_BUSY", isBusy: true, label: "decrypting" });
       try {
@@ -1009,7 +584,8 @@ export default function App() {
       } catch (error) {
         pushToast(errorText(error), "error");
       } finally {
-        dispatch({ type: "SET_BUSY", isBusy: false });
+        operation.current = false;
+      dispatch({ type: "SET_BUSY", isBusy: false });
       }
     },
     [pushToast, state.contacts, state.identity, state.pq]
@@ -1020,98 +596,104 @@ export default function App() {
   }, []);
 
   return (
-    <div className="min-h-screen bg-[#0d0f14] font-mono text-zinc-100">
+    <div className="min-h-screen bg-canvas-soft font-sans text-ink">
       <ToastStack toasts={state.toasts} onDismiss={(id) => dispatch({ type: "DISMISS_TOAST", id })} />
 
-      <header className="border-b border-white/10 bg-black/30">
-        <div className="mx-auto flex max-w-7xl flex-col gap-3 px-4 py-4 sm:flex-row sm:items-center sm:justify-between">
+      <header className="border-b border-hairline bg-canvas">
+        <div className="mx-auto flex max-w-7xl flex-col gap-3 px-6 py-3 sm:min-h-16 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-lg border border-[#7c3aed]/40 bg-[#7c3aed]/15">
-              <LockIcon active={state.isBusy} className="h-5 w-5" />
+            <div className="flex h-8 w-8 items-center justify-center rounded-md bg-ink text-on-primary">
+              <LockIcon active={state.isBusy} className="h-4 w-4" />
             </div>
-            <div>
-              <h1 className="text-lg font-semibold text-white">Post-Quantum Secure Messaging</h1>
-              <div className="mt-1 flex flex-wrap gap-1.5">
-                <Pill tone="purple">{KEX_ALG}</Pill>
-                <Pill tone="purple">{KEM_ALG}</Pill>
-                <Pill tone="purple">{SIG_ALG}</Pill>
-              </div>
+            <h1 className="text-base font-semibold tracking-[-0.32px]">Post-Quantum Secure Messaging</h1>
+            <div className="hidden flex-wrap gap-1.5 md:flex">
+              <Pill mono>{KEX_ALG}</Pill>
+              <Pill mono>{KEM_ALG}</Pill>
+              <Pill mono>{SIG_ALG}</Pill>
             </div>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
             {state.pq?.simulated && <SimulatedBadge />}
-            <Pill tone="green">WebCrypto native</Pill>
-            {state.isBusy && <Pill tone="purple">{state.busyLabel || "working"}</Pill>}
+            <Pill>WebCrypto + real PQ</Pill>
+            <span className="inline-flex h-5 items-center gap-1.5 rounded-full bg-canvas-soft-2 px-2 text-xs font-medium text-body shadow-hairline">
+              <span
+                aria-hidden="true"
+                className={`h-1.5 w-1.5 rounded-full ${
+                  relayStatus === "connected" ? "bg-link" : relayStatus === "connecting" ? "animate-pulse bg-warning" : "bg-hairline-strong"
+                }`}
+              />
+              Relay {relayStatus}
+            </span>
+            {accountId && relayStatus === 'offline' && <button className={`${buttonSecondary} h-7 text-xs`} onClick={() => setRelayAttempt((attempt) => attempt + 1)}>Reconnect</button>}
+            {state.isBusy && <Pill mono>{state.busyLabel || "working"}…</Pill>}
           </div>
         </div>
       </header>
 
       {state.phase === "booting" && (
-        <main className="mx-auto flex max-w-7xl items-center justify-center px-4 py-24">
-          <div className="rounded-lg border border-white/10 bg-white/[0.03] p-6 text-center">
-            <LockIcon active className="mx-auto mb-4 h-9 w-9" />
-            <div className="text-sm text-zinc-300">Generating hybrid key material...</div>
+        <main className="mx-auto flex max-w-7xl items-center justify-center px-6 py-24">
+          <div className={`${card} p-8 text-center`}>
+            <LockIcon active className="mx-auto mb-4 h-8 w-8" />
+            <div className="text-sm text-body">Generating hybrid key material…</div>
           </div>
         </main>
       )}
 
       {state.phase === "error" && (
-        <main className="mx-auto max-w-2xl px-4 py-16">
-          <div className="rounded-lg border border-rose-400/30 bg-rose-950/30 p-5">
-            <h2 className="mb-2 text-sm font-semibold text-rose-100">Initialization failed</h2>
-            <p className="break-words text-sm text-rose-200">{state.bootError}</p>
+        <main className="mx-auto max-w-2xl px-6 py-16">
+          <div className="rounded-lg bg-error-soft p-5" role="alert">
+            <h2 className="mb-2 text-sm font-semibold text-error-deep">Initialization failed</h2>
+            <p className="break-words text-sm text-error-deep">{state.bootError}</p>
           </div>
         </main>
       )}
 
       {state.phase === "ready" && (
-        <main className="mx-auto grid max-w-7xl grid-cols-1 gap-4 p-4 lg:grid-cols-[360px_minmax(0,1fr)]">
-          <aside className="space-y-4">
-            <section className="rounded-lg border border-white/10 bg-white/[0.03] p-4">
-              <div className="mb-3 flex items-center justify-between gap-3">
-                <h2 className="text-sm font-semibold text-zinc-100">Key Management</h2>
+        <main className="mx-auto grid max-w-7xl grid-cols-1 gap-6 px-6 py-6 lg:grid-cols-[340px_minmax(0,1fr)]">
+          <aside className="space-y-6">
+            <section className={`${card} p-5`}>
+              <div className="mb-4 flex items-center justify-between gap-3">
+                <h2 className="text-sm font-semibold tracking-[-0.28px]">Key management</h2>
                 <button
                   type="button"
+                  disabled={state.isBusy}
                   onClick={handleRegenerate}
-                  className="inline-flex items-center gap-2 rounded-md border border-white/10 px-2.5 py-1.5 text-xs text-zinc-200 hover:border-[#7c3aed]/60 hover:text-violet-200"
+                  className={`${buttonSecondary} h-7 px-2.5 text-xs`}
                 >
                   <RefreshIcon className="h-3.5 w-3.5" />
                   Regenerate
                 </button>
               </div>
 
-              <div className="mb-3 rounded-md border border-[#7c3aed]/30 bg-[#7c3aed]/10 p-3">
-                <div className="mb-1 text-[11px] text-zinc-500">public fingerprint</div>
-                <div className="font-mono text-lg text-violet-100">{state.identity?.fingerprint}</div>
+              <div className={eyebrow}>Public fingerprint</div>
+              <div className="mt-1 break-all font-mono text-lg tracking-tight">{state.identity?.fingerprint}</div>
+
+              <div className="mt-4 divide-y divide-hairline rounded-md shadow-hairline">
+                {[
+                  [KEX_ALG, keyStats?.x25519],
+                  [KEM_ALG, keyStats?.mlkem],
+                  [SIG_ALG, keyStats?.mldsa],
+                ].map(([name, size]) => (
+                  <div key={name} className="flex items-center justify-between px-3 py-2">
+                    <span className="font-mono text-xs">{name}</span>
+                    <span className="font-mono text-xs text-mute">{size !== undefined && formatBytes(size)}</span>
+                  </div>
+                ))}
               </div>
 
-              <div className="mb-3 grid grid-cols-1 gap-2 text-xs">
-                <div className="flex items-center justify-between rounded-md border border-white/10 bg-black/20 px-3 py-2">
-                  <Pill tone="zinc">{KEX_ALG}</Pill>
-                  <span className="text-zinc-400">{keyStats && formatBytes(keyStats.x25519)}</span>
-                </div>
-                <div className="flex items-center justify-between rounded-md border border-white/10 bg-black/20 px-3 py-2">
-                  <Pill tone="zinc">{KEM_ALG}</Pill>
-                  <span className="text-zinc-400">{keyStats && formatBytes(keyStats.mlkem)}</span>
-                </div>
-                <div className="flex items-center justify-between rounded-md border border-white/10 bg-black/20 px-3 py-2">
-                  <Pill tone="zinc">{SIG_ALG}</Pill>
-                  <span className="text-zinc-400">{keyStats && formatBytes(keyStats.mldsa)}</span>
-                </div>
-              </div>
-
-              <div className="text-[11px] text-zinc-500">public key export</div>
+              <div className={`${eyebrow} mt-4`}>Public key export</div>
               <div className="mt-2 flex gap-2">
                 <textarea
                   readOnly
+                  aria-label="Public key export"
                   value={state.identity?.publicExport || ""}
-                  className="h-24 min-w-0 flex-1 resize-none rounded-md border border-white/10 bg-black/40 p-2 font-mono text-xs text-zinc-300 outline-none"
+                  className={`${formField} h-24 min-w-0 flex-1 resize-none bg-canvas-soft py-2 font-mono text-xs text-body`}
                 />
                 <button
                   type="button"
                   onClick={() => copyText(state.identity?.publicExport || "", "Public key copied.")}
-                  className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-white/10 text-zinc-300 hover:border-[#7c3aed]/60 hover:text-violet-200"
+                  className={`${iconButton} h-9 w-9`}
                   title="Copy public key"
                   aria-label="Copy public key"
                 >
@@ -1120,75 +702,80 @@ export default function App() {
               </div>
             </section>
 
-            <section className="rounded-lg border border-white/10 bg-white/[0.03] p-4">
-              <h2 className="mb-3 text-sm font-semibold text-zinc-100">Contact Book</h2>
+            <section className={`${card} p-5`}>
+              <h2 className="mb-4 text-sm font-semibold tracking-[-0.28px]">Contact book</h2>
 
               <div className="space-y-2">
                 <input
                   value={contactName}
                   onChange={(event) => setContactName(event.target.value)}
                   placeholder="Display name"
-                  className="w-full rounded-md border border-white/10 bg-black/40 px-3 py-2 text-sm text-zinc-100 outline-none placeholder:text-zinc-600 focus:border-[#7c3aed]/60"
+                  aria-label="Contact display name"
+                  className={`${formField} h-10`}
                 />
                 <textarea
                   value={contactKey}
                   onChange={(event) => setContactKey(event.target.value)}
                   placeholder="Base64 public key"
-                  className="h-20 w-full resize-none rounded-md border border-white/10 bg-black/40 px-3 py-2 text-sm text-zinc-100 outline-none placeholder:text-zinc-600 focus:border-[#7c3aed]/60"
+                  aria-label="Contact base64 public key"
+                  className={`${formField} h-20 resize-none py-2 font-mono text-xs`}
                 />
                 <button
                   type="button"
+                  disabled={state.isBusy}
                   onClick={handleAddContact}
-                  className="w-full rounded-md border border-[#7c3aed]/50 bg-[#7c3aed]/20 px-3 py-2 text-sm font-semibold text-violet-100 hover:bg-[#7c3aed]/30"
+                  className={`${buttonPrimary} h-10 w-full text-sm`}
                 >
                   Add contact
                 </button>
               </div>
 
-              <div className="mt-4 space-y-2">
-                {state.contacts.map((contact) => (
-                  <button
-                    key={contact.id}
-                    type="button"
-                    onClick={() => dispatch({ type: "SELECT_CONTACT", id: contact.id })}
-                    className={`w-full rounded-md border p-3 text-left transition ${
-                      contact.id === state.selectedContactId
-                        ? "border-[#7c3aed]/70 bg-[#7c3aed]/15"
-                        : "border-white/10 bg-black/20 hover:border-white/20"
-                    }`}
-                  >
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="truncate text-sm font-semibold text-zinc-100">{contact.name}</span>
-                      {contact.demoPrivate && <Pill tone="green">demo</Pill>}
-                    </div>
-                    <div className="mt-1 font-mono text-xs text-zinc-500">{contact.fingerprint}</div>
-                  </button>
-                ))}
+              <div className="mt-5 space-y-1">
+                {state.contacts.map((contact) => {
+                  const selected = contact.id === state.selectedContactId;
+                  return (
+                    <button
+                      key={contact.id}
+                      type="button"
+                      aria-pressed={selected}
+                      onClick={() => dispatch({ type: "SELECT_CONTACT", id: contact.id })}
+                      className={`w-full rounded-md px-3 py-2.5 text-left transition-colors ${
+                        selected ? "bg-canvas-soft-2 shadow-[inset_2px_0_0_var(--color-ink)]" : "hover:bg-canvas-soft"
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className={`truncate text-sm ${selected ? "font-medium text-ink" : "text-body"}`}>{contact.name}</span>
+                        {contact.demoPrivate && <Pill>Demo</Pill>}
+                      </div>
+                      <div className="mt-0.5 font-mono text-xs text-mute">{contact.fingerprint}</div>
+                    </button>
+                  );
+                })}
               </div>
             </section>
           </aside>
 
-          <section className="grid min-w-0 grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1fr)_300px]">
-            <div className="flex min-w-0 flex-col rounded-lg border border-white/10 bg-white/[0.03]">
-              <div className="border-b border-white/10 p-4">
+          <section className="grid min-w-0 grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1fr)_280px]">
+            <div className={`${card} flex min-w-0 flex-col`}>
+              <div className="border-b border-hairline px-5 py-4">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
-                    <h2 className="text-sm font-semibold text-zinc-100">
+                    <h2 className="text-xl font-semibold tracking-[-0.6px]">
                       {selectedContact ? selectedContact.name : "No contact selected"}
                     </h2>
-                    {selectedContact && <div className="mt-1 font-mono text-xs text-zinc-500">{selectedContact.fingerprint}</div>}
+                    {selectedContact && <div className="mt-0.5 font-mono text-xs text-mute">{selectedContact.fingerprint}</div>}
                   </div>
                   <div className="flex flex-wrap gap-1.5">
-                    <Pill tone="purple">{KEM_ALG}</Pill>
-                    <Pill tone="purple">{AES_ALG}</Pill>
+                    <Pill mono>{KEM_ALG}</Pill>
+                    <Pill mono>{AES_ALG}</Pill>
                   </div>
                 </div>
               </div>
 
-              <div className="h-[52vh] min-h-[420px] space-y-3 overflow-y-auto p-4">
+              <div className="h-[52vh] min-h-[420px] space-y-4 overflow-y-auto bg-canvas-soft/60 p-5">
                 {thread.length === 0 && (
-                  <div className="rounded-lg border border-dashed border-white/10 p-6 text-center text-sm text-zinc-500">
-                    No encrypted packets in this thread.
+                  <div className="rounded-lg border border-dashed border-hairline-strong/60 p-8 text-center text-sm text-mute">
+                    No encrypted packets in this thread yet.
                   </div>
                 )}
                 {thread.map((message) => (
@@ -1198,6 +785,7 @@ export default function App() {
                     identity={state.identity}
                     contacts={state.contacts}
                     pq={state.pq}
+                    isBusy={state.isBusy}
                     onCopy={copyText}
                     onDecrypt={handleDecrypt}
                     onHide={handleHide}
@@ -1205,23 +793,24 @@ export default function App() {
                 ))}
               </div>
 
-              <div className="border-t border-white/10 p-4">
-                <div className="flex flex-col gap-3 sm:flex-row">
+              <div className="border-t border-hairline p-4">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
                   <textarea
                     value={composer}
                     onChange={(event) => setComposer(event.target.value)}
                     placeholder={selectedContact ? `Message ${selectedContact.name}` : "Select a contact"}
-                    className="min-h-24 min-w-0 flex-1 resize-none rounded-md border border-white/10 bg-black/40 px-3 py-2 text-sm text-zinc-100 outline-none placeholder:text-zinc-600 focus:border-[#7c3aed]/60"
+                    aria-label="Message"
+                    className={`${formField} min-h-24 min-w-0 flex-1 resize-none py-2.5`}
                     disabled={!selectedContact || state.isBusy}
                   />
                   <button
                     type="button"
                     onClick={handleSend}
                     disabled={!selectedContact || state.isBusy}
-                    className="inline-flex items-center justify-center gap-2 rounded-md border border-[#7c3aed]/50 bg-[#7c3aed]/25 px-4 py-3 text-sm font-semibold text-violet-100 hover:bg-[#7c3aed]/35 disabled:cursor-not-allowed disabled:opacity-50 sm:w-44"
+                    className={`${buttonPrimary} h-10 px-4 text-sm sm:w-44`}
                   >
                     <SendIcon className="h-4 w-4" />
-                    Encrypt & Send
+                    Encrypt & send
                   </button>
                 </div>
               </div>
