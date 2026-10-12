@@ -139,7 +139,8 @@ function publicBytesFromBundle(bundle) {
 }
 
 async function fingerprintForBundle(bundle) {
-  return toHex(await sha256(publicBundleBytes(bundle))).slice(0, 16);
+  // 128-bit fingerprint: compared by hand, so it must resist collision search.
+  return toHex(await sha256(publicBundleBytes(bundle))).slice(0, 32);
 }
 
 async function importPublicBundle(value) {
@@ -250,7 +251,6 @@ async function encryptMessage({ plaintext, senderKeys, senderPublicBundle, recip
       tag: tag.length,
       signature: signature.length,
     },
-    simulatedPq: pq.simulated,
   };
 }
 
@@ -329,7 +329,6 @@ async function buildDemoApp(pq) {
     recipientPublicBundle: identity.publicBundle,
     packet: encrypted.packet,
     byteCounts: encrypted.byteCounts,
-    simulatedPq: encrypted.simulatedPq,
     createdAt: Date.now(),
     decrypted: null,
   };
@@ -351,7 +350,7 @@ function validateBundle(bundle) {
 }
 async function createPqProvider() {
   return {
-    name: 'noble-post-quantum', simulated: false,
+    name: 'noble-post-quantum',
     async generateKemKeyPair() { const pair = ml_kem768.keygen(); return { publicKey: pair.publicKey, privateKey: pair.secretKey }; },
     async kemEncapsulate(publicKey) { const result = ml_kem768.encapsulate(publicKey); return { ciphertext: result.cipherText, sharedSecret: result.sharedSecret }; },
     async kemDecapsulate(ciphertext, privateKey) { return ml_kem768.decapsulate(ciphertext, privateKey); },

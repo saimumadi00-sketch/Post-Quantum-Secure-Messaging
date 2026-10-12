@@ -10,7 +10,7 @@ test('real PQ round trip rejects tampering, wrong keys, and invalid bundles', as
   const sender = await generateHybridMaterial(pq);
   const recipient = await generateHybridMaterial(pq);
   const encrypted = await encryptMessage({ plaintext: 'Hello বাংলা 🔒', senderKeys: sender.keys, senderPublicBundle: sender.publicBundle, recipientPublicBundle: recipient.publicBundle, pq });
-  assert.equal(pq.simulated, false);
+  assert.equal(pq.name, 'noble-post-quantum');
   assert.equal(encrypted.byteCounts.signature, 3309);
   const message = { packet: encrypted.packet, senderPublicBundle: sender.publicBundle, recipientPublicBundle: recipient.publicBundle };
   const open = (candidate, keys = recipient.keys) => decryptMessage({ message: candidate, recipientKeys: keys, pq });
@@ -59,6 +59,6 @@ test('two independent clients exchange only ciphertext through local relay', { t
   assert.equal((await decryptMessage({ message: { packet: frame.packet, senderPublicBundle: alice.publicBundle, recipientPublicBundle: bob.publicBundle }, recipientKeys: bob.keys, pq })).plaintext, 'Relay hello');
   assert.equal(JSON.parse((await delivered)[0]).type, 'delivered');
   const offline = once(a, 'message');
-  a.send(JSON.stringify({ type: 'message', packet: { ...packet, header: { ...packet.header, recipient: '0000000000000000' } } }));
+  a.send(JSON.stringify({ type: 'message', packet: { ...packet, header: { ...packet.header, recipient: '0'.repeat(32) } } }));
   assert.equal(JSON.parse((await offline)[0]).type, 'error');
 });

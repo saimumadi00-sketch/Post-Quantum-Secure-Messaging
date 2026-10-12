@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 
-import { KEM_ALG,SIG_ALG,KEX_ALG,AES_ALG,HKDF_INFO,newId,toHex,shortHex,formatBytes,publicBytesFromBundle,importPublicBundle,packetBytes,packetToWireBytes,encryptMessage,decryptMessage,buildDemoApp,createPqProvider,generateHybridMaterial,fingerprintForBundle } from './crypto.js';
+import { KEM_ALG,SIG_ALG,KEX_ALG,AES_ALG,newId,toHex,shortHex,formatBytes,publicBytesFromBundle,importPublicBundle,packetBytes,packetToWireBytes,encryptMessage,decryptMessage,buildDemoApp,createPqProvider } from './crypto.js';
 import { registrationBytes } from './auth/registration.js';
 
 const initialState = {
@@ -70,7 +70,7 @@ function reducer(state, action) {
         },
       };
     }
-    case "HIDE_DECRYPTED": {
+    case "SET_REVEALED": {
       const thread = state.messages[action.contactId] || [];
       return {
         ...state,
@@ -78,7 +78,7 @@ function reducer(state, action) {
           ...state.messages,
           [action.contactId]: thread.map((message) =>
             message.id === action.messageId && message.decrypted
-              ? { ...message, decrypted: { ...message.decrypted, revealed: false } }
+              ? { ...message, decrypted: { ...message.decrypted, revealed: action.revealed } }
               : message
           ),
         },
@@ -110,10 +110,6 @@ function Pill({ children, tone = "neutral", mono = false }) {
       {children}
     </span>
   );
-}
-
-function SimulatedBadge() {
-  return <Pill tone="warning">Simulated PQ</Pill>;
 }
 
 function SignatureBadge({ valid }) {
@@ -278,7 +274,7 @@ function AlgorithmSidebar() {
   );
 }
 
-function MessageCard({ message, identity, contacts, pq, isBusy, onCopy, onDecrypt, onHide }) {
+function MessageCard({ message, identity, pq, isBusy, onCopy, onDecrypt, onHide }) {
   const wireBytes = useMemo(() => packetToWireBytes(message.packet), [message.packet]);
   const fields = useMemo(() => packetBytes(message.packet), [message.packet]);
   const isOutgoing = message.direction === "outgoing";
@@ -298,7 +294,6 @@ function MessageCard({ message, identity, contacts, pq, isBusy, onCopy, onDecryp
           <div className="flex flex-wrap items-center gap-1.5">
             <Pill mono>{KEM_ALG}</Pill>
             <Pill mono>{AES_ALG}</Pill>
-            {message.simulatedPq && <SimulatedBadge />}
           </div>
         </div>
 
@@ -340,10 +335,7 @@ function MessageCard({ message, identity, contacts, pq, isBusy, onCopy, onDecryp
 
         {message.decrypted?.revealed && (
           <div className="mt-3 rounded-md bg-canvas p-3 shadow-hairline">
-            <div className="mb-2 flex flex-wrap items-center gap-2">
-              <span className={eyebrow}>Plaintext</span>
-              <Pill mono>{HKDF_INFO.length} B HKDF info</Pill>
-            </div>
+            <div className={`${eyebrow} mb-2`}>Plaintext</div>
             <p className="whitespace-pre-wrap break-words leading-6 text-ink">{message.decrypted.plaintext}</p>
           </div>
         )}
@@ -386,10 +378,11 @@ export default function App({ auth = null }) {
           selectedContactId: demo.selectedContactId,
           messages: demo.messages,
         });
-
+        return true;
       } catch (error) {
         dispatch({ type: "BOOT_ERROR", error: errorText(error) });
         pushToast(errorText(error), "error");
+        return false;
       }
     },
     [pushToast]
@@ -438,11 +431,12 @@ export default function App({ auth = null }) {
         if (!header || seenPackets.current.has(header.id)) throw new Error('Duplicate or invalid packet rejected.');
         const contact = current.contacts.find((entry) => !entry.demoPrivate && entry.fingerprint === header.sender);
         if (!contact) throw new Error('Unknown sender. Import and verify their public key first.');
-        const message = { id: header.id, contactId: contact.id, direction: 'incoming', senderId: contact.id, recipientId: 'me', senderName: contact.name, recipientName: 'You', senderPublicBundle: contact.publicBundle, recipientPublicBundle: current.identity.publicBundle, packet: frame.packet, simulatedPq: false, createdAt: Date.now(), decrypted: null };
-        await decryptMessage({ message, recipientKeys: current.identity.keys, pq: current.pq });
+        const message = { id: header.id, contactId: contact.id, direction: 'incoming', senderId: contact.id, recipientId: 'me', senderName: contact.name, recipientName: 'You', senderPublicBundle: contact.publicBundle, recipientPublicBundle: current.identity.publicBundle, packet: frame.packet, createdAt: Date.now(), decrypted: null };
+        // Verify before accepting; keep the result hidden so Decrypt only reveals it.
+        const result = await decryptMessage({ message, recipientKeys: current.identity.keys, pq: current.pq });
         if (relay.current !== socket) return;
         seenPackets.current.add(header.id);
-        dispatch({ type: 'ADD_MESSAGE', message });
+        dispatch({ type: 'ADD_MESSAGE', message: { ...message, decrypted: { ...result, revealed: false } } });
         pushToast('Authenticated message received.', 'success');
       }).catch((error) => pushToast(errorText(error)));
     };
@@ -482,8 +476,9 @@ export default function App({ auth = null }) {
     if (operation.current) return;
     if (!window.confirm("Regenerate hybrid keys? Existing demo threads will be replaced.")) return;
     operation.current = true;
-    try { await loadDemo(state.pq); } finally { operation.current = false; }
-    pushToast("Hybrid keys regenerated.", "success");
+    let regenerated = false;
+    try { regenerated = await loadDemo(state.pq); } finally { operation.current = false; }
+    if (regenerated) pushToast("Hybrid keys regenerated.", "success");
   }, [loadDemo, pushToast, state.pq]);
 
   const handleAddContact = useCallback(async () => {
@@ -543,7 +538,6 @@ export default function App({ auth = null }) {
         recipientPublicBundle: selectedContact.publicBundle,
         packet: encrypted.packet,
         byteCounts: encrypted.byteCounts,
-        simulatedPq: encrypted.simulatedPq,
         createdAt: Date.now(),
         decrypted: null,
       };
@@ -565,6 +559,10 @@ export default function App({ auth = null }) {
 
   const handleDecrypt = useCallback(
     async (message) => {
+      if (message.decrypted) {
+        dispatch({ type: "SET_REVEALED", contactId: message.contactId, messageId: message.id, revealed: true });
+        return;
+      }
       if (!state.identity || !state.pq || operation.current) return;
       operation.current = true;
 
@@ -592,7 +590,7 @@ export default function App({ auth = null }) {
   );
 
   const handleHide = useCallback((message) => {
-    dispatch({ type: "HIDE_DECRYPTED", contactId: message.contactId, messageId: message.id });
+    dispatch({ type: "SET_REVEALED", contactId: message.contactId, messageId: message.id, revealed: false });
   }, []);
 
   return (
@@ -614,7 +612,6 @@ export default function App({ auth = null }) {
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            {state.pq?.simulated && <SimulatedBadge />}
             <Pill>WebCrypto + real PQ</Pill>
             <span className="inline-flex h-5 items-center gap-1.5 rounded-full bg-canvas-soft-2 px-2 text-xs font-medium text-body shadow-hairline">
               <span
@@ -783,7 +780,6 @@ export default function App({ auth = null }) {
                     key={message.id}
                     message={message}
                     identity={state.identity}
-                    contacts={state.contacts}
                     pq={state.pq}
                     isBusy={state.isBusy}
                     onCopy={copyText}
